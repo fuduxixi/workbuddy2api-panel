@@ -1,0 +1,158 @@
+name: sync-upstream
+
+# 自动同步上游，但带「上游不可用」保护：
+#   - 上游删库 / 转私有 / 归档 / 禁用      → 跳过，不动本仓库
+#   - 上游关键文件缺失（如只剩 README）     → 跳过
+#   - 上游文件数相对本仓库塌缩超过 40%      → 跳过（防批量删文件）
+#   - 合并冲突 / 合并后 go build、go test 失败 → 回滚，不推送
+# 只有「守卫全过 + 合并干净 + 构建测试通过」才推送 main。
+on:
+  schedule:
+    - cron: "17 */3 * * *" # UTC，每 3 小时一次
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只演练（合并 + 构建 + 测试，不推送）"
+        type: boolean
+        default: false
+      upstream:
+        description: "临时指定上游 owner/repo（留空用默认值，仅用于验证守卫）"
+        required: false
+      ref:
+        description: "临时指定上游 ref（留空用上游默认分支）"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  DEFAULT_UPSTREAM: misakano7545/workbuddy2api-panel
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 上游守卫 + 合并 + 构建验证
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          UPSTREAM: ${{ inputs.upstream }}
+          REF_IN: ${{ inputs.ref }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -uo pipefail
+
+          UP="${UPSTREAM:-$DEFAULT_UPSTREAM}"
+          DRY="${DRY_RUN:-false}"
+          [ "$DRY" = "true" ] && DRY=true || DRY=false
+          OUT="$GITHUB_OUTPUT"
+
+          skip() {
+            echo "result=skipped" >> "$OUT"
+            echo "reason=$1" >> "$OUT"
+            echo "::notice title=跳过同步::$1"
+            { echo "### 跳过同步"; echo; echo "**上游**：\`$UP\`"; echo; echo "**原因**：$1"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          fail() {
+            echo "result=failed" >> "$OUT"
+            echo "reason=$1" >> "$OUT"
+            echo "::error title=同步失败::$1"
+            { echo "### 同步失败（本仓库未被修改）"; echo; echo "**上游**：\`$UP\`"; echo; echo "**原因**：$1"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          # ---------- 守卫 1：上游仓库存在、未归档、未禁用 ----------
+          if ! info=$(gh api "repos/$UP" 2>/dev/null); then
+            skip "上游仓库不可访问（已删除、改名或转为私有）"
+          fi
+          archived=$(jq -r '.archived // false' <<<"$info")
+          disabled=$(jq -r '.disabled // false' <<<"$info")
+          [ "$archived" = "true" ] && skip "上游仓库已归档（archived）"
+          [ "$disabled" = "true" ] && skip "上游仓库已禁用（disabled）"
+
+          DEF_BRANCH=$(jq -r '.default_branch // "main"' <<<"$info")
+          REF="${REF_IN:-$DEF_BRANCH}"
+
+          # ---------- 守卫 2：关键文件齐全（防「只留 README」） ----------
+          for p in go.mod cmd/server/main.go internal/panel/app.js Dockerfile config.example.json; do
+            if ! gh api "repos/$UP/contents/$p?ref=$REF" >/dev/null 2>&1; then
+              skip "上游缺少关键文件：$p（疑似被清空或大改结构）"
+            fi
+          done
+
+          # ---------- 守卫 3：文件规模不塌缩 ----------
+          UP_SHA=$(gh api "repos/$UP/commits/$REF" --jq .sha 2>/dev/null) || skip "取不到上游 $REF 的提交"
+          TREE=$(gh api "repos/$UP/git/trees/$UP_SHA?recursive=1" 2>/dev/null) || skip "取不到上游文件树"
+          UP_BLOBS=$(jq '[.tree[] | select(.type=="blob")] | length' <<<"$TREE")
+          UP_GO=$(jq '[.tree[] | select(.type=="blob" and (.path|endswith(".go")))] | length' <<<"$TREE")
+          LOCAL_BLOBS=$(git ls-tree -r --name-only origin/main | wc -l | tr -d ' ')
+          LOCAL_GO=$(git ls-tree -r --name-only origin/main | grep -c '\.go$' || true)
+
+          if [ "$LOCAL_BLOBS" -gt 0 ] && [ $((UP_BLOBS * 10)) -lt $((LOCAL_BLOBS * 6)) ]; then
+            skip "上游文件数塌缩：${UP_BLOBS} 个（本仓库 ${LOCAL_BLOBS} 个），删除比例超过 40%"
+          fi
+          if [ "$LOCAL_GO" -gt 0 ] && [ $((UP_GO * 10)) -lt $((LOCAL_GO * 6)) ]; then
+            skip "上游 Go 源文件塌缩：${UP_GO} 个（本仓库 ${LOCAL_GO} 个）"
+          fi
+
+          # ---------- 拉取上游 ----------
+          git remote add upstream "https://github.com/$UP.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/$UP.git"
+          git fetch --no-tags upstream "$REF" || skip "拉取上游 $REF 失败"
+          UP_HEAD=$(git rev-parse FETCH_HEAD)
+          AHEAD=$(git rev-list --count "origin/main..$UP_HEAD" || echo 0)
+
+          echo "upstream=$UP ref=$REF head=$UP_HEAD blobs=$UP_BLOBS go=$UP_GO new_commits=$AHEAD" 
+          if [ "$AHEAD" -eq 0 ]; then
+            skip "已是最新（上游无本仓库尚未包含的提交）"
+          fi
+
+          # ---------- 合并 ----------
+          git config user.name "upstream-sync-bot"
+          git config user.email "upstream-sync-bot@users.noreply.github.com"
+          if ! git merge --no-ff --no-edit -m "chore(sync): 合并上游 $UP@${UP_HEAD:0:8}（自动同步）" "$UP_HEAD" > /tmp/merge.log 2>&1; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            git merge --abort || true
+            tail -20 /tmp/merge.log
+            fail "合并冲突，需人工处理：${CONFLICTS:-见日志}"
+          fi
+
+          # ---------- 合并后验证：能编译、测试通过 ----------
+          if ! go build ./... ; then
+            git reset --hard origin/main
+            fail "合并后 go build 失败，已回滚"
+          fi
+          if ! go test ./... -count=1 ; then
+            git reset --hard origin/main
+            fail "合并后 go test 失败，已回滚"
+          fi
+
+          MERGED=$(git rev-parse HEAD)
+
+          # ---------- 推送 ----------
+          if [ "$DRY" = "true" ]; then
+            git reset --hard origin/main
+            echo "result=dry-run" >> "$OUT"
+            echo "reason=演练通过（$AHEAD 个提交可干净合并、构建与测试通过），未推送" >> "$OUT"
+            { echo "### 演练通过（未推送）"; echo; echo "- 上游：\`$UP@$REF\`"; echo "- 待合并提交：$AHEAD"; echo "- 合并后提交：\`$MERGED\`"; echo "- go build / go test 通过"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
+          echo "result=synced" >> "$OUT"
+          echo "reason=已同步 $AHEAD 个上游提交（$MERGED）" >> "$OUT"
+          { echo "### 同步完成"; echo; echo "- 上游：\`$UP@$REF\`"; echo "- 合并提交：\`$MERGED\`"; echo "- 新增上游提交：$AHEAD"; echo "- go build / go test 通过后推送 main"; } >> "$GITHUB_STEP_SUMMARY"
