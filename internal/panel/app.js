@@ -7,7 +7,7 @@ let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null, updateData = null, updateBusy = false;
-let logPin = true, loginState = null, loginTimer = null;
+let logPin = true, loginState = null, loginTimer = null, loginStartAt = 0;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -608,7 +608,7 @@ function renderModelLocks(rows) {
     const fully = r.fully_unlock_at && !/^0001-/.test(r.fully_unlock_at) ? fmtLocalDateTime(r.fully_unlock_at) : '—';
     return '<tr>' +
       '<td><b>' + esc(r.model) + '</b></td>' +
-      '<td>' + (r.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '国内版') + '</td>' +
+      '<td>' + (r.realm === 'global' ? '国际版' : '国内版') + '</td>' +
       '<td><span class="tag ' + cls + '">' + label + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
       '<td class="num">' + (r.locked || 0) + '</td>' +
@@ -1687,6 +1687,7 @@ function openAdd() {
   $('importDone').hidden = true; $('importErr').hidden = true;
   $('apiKeyDone').hidden = true; $('apiKeyErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
+  $('addQr').hidden = true; $('addQr').innerHTML = ''; // 上一次的 state 已作废，二维码不留
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   $('btnAddApiKey').hidden = true;
   stopPoll();
@@ -1711,7 +1712,22 @@ function startAddLogin() {
   $('addLoad').hidden = false; $('addErr').hidden = true;
   api('login/start', { method: 'POST', body: JSON.stringify({ site }) }).then(r => {
     loginState = r.state;
+    loginStartAt = Date.now();
     $('addUrl').textContent = r.url;
+    // 手机/异地添加：链接转发常被 IM 预览抓取或截断 state，扫码这条路径不受影响。
+    // 超出编码容量（workbuddy 站带 ww_device_nonce 时 157 字节）就只留链接。
+    try {
+      const M = qrMatrix(r.url);
+      // 模块整数像素（4×）：非整数的 viewBox 缩放会把模块边缘糊成半像素，手机更难扫。
+      $('addQr').innerHTML = qrSVG(M, (M.length + 8) * 4);
+      $('addQr').hidden = false;
+    } catch (e) {
+      // shortcut: 编码器到 v6（134 字节）为止；装了 CODEBUDDY_LOGIN_DEVICE_NONCE 的
+      // workbuddy 站链接 157 字节编不出来，再往上要补版本信息块，那时再升 v8。
+      // 但降级必须说出来 —— 静默不显示二维码会被当成 bug 反复报。
+      $('addQr').innerHTML = '<span class="note">链接过长，无法生成二维码，请用下方「复制链接」或「在浏览器打开」</span>';
+      $('addQr').hidden = false;
+    }
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
     $('addLoad').hidden = true; $('addReady').hidden = false;
     $('btnStartLogin').hidden = true;
@@ -1752,6 +1768,12 @@ async function pollLogin() {
       $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
       invalidatePackages(); // 凭据换新：缓存里的旧 401 行必须作废
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+    }
+    // 浏览器侧一旦显示「登录失败」，这边只会一直 pending 到 15 分钟 TTL，用户盯着
+    // 「等待中」不知道要不要重来。90s 后给一次可操作提示，别让他空等。
+    if (!r.done && loginStartAt && Date.now() - loginStartAt > 90000 && $('addErr').hidden) {
+      $('addErr').hidden = false;
+      $('addErr').textContent = '仍在等待浏览器完成登录。若浏览器已显示「登录失败」，请关闭本窗口重新获取授权链接（链接 15 分钟内有效）。';
     }
   } catch (e) {
     if (e.status === 404 || e.status === 410) {
@@ -2707,6 +2729,7 @@ function renderUsage(d) {
   renderUsageDim();
   renderCreditDim();
   renderUsageChart(usageData.series || []);
+  renderUsageHours(usageData.series || []);
 }
 
 // 维度切换 / 排序控件。
@@ -2743,6 +2766,46 @@ if ($('usSort')) $('usSort').onchange = () => {
  * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
  * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
  */
+
+/* renderUsageHours 填「积分与 token 按小时」表：直接消费 series 时序点（hour 点
+   一小时一行、day 点一行代表当天聚合），最新时段排在最上面。此前这张表只有静态
+   表头、没有任何渲染代码，用户永远看到一张空表。token/积分 = 合计 Token ÷ 该时段
+   实测扣除积分（兑换率），没有积分样本的时段留 —，不拿 0 顶替。 */
+function renderUsageHours(series) {
+  const body = $('usHourBody');
+  if (!body) return;
+  const rows = [];
+  for (const p of (series || [])) {
+    if (parsePointTime(p) !== null) rows.push(p);
+  }
+  // 最新时段排最上面。后端 series 是「日桶升序 + 小时桶升序」两段拼接，简单 reverse
+  // 对混合窗口会错序，直接按时间戳降序排，与输入顺序解耦。
+  rows.sort((a, b) => parsePointTime(b) - parsePointTime(a));
+  body.innerHTML = rows.map(p => {
+    const tt = Number(p.total_tokens || 0);
+    const cr = Number(p.credits || 0);
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + esc(usHourLabel(p)) + '</td>' +
+      '<td class="num">' + fmtTok(p.requests) + '</td>' +
+      '<td class="num">' + fmtTok(p.prompt_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(p.completion_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(p.total_tokens) + '</td>' +
+      '<td class="num">' + (cr ? fmtCredit(p.credits) : '—') + '</td>' +
+      '<td class="num">' + (cr > 0 && tt > 0 ? fmtTok(tt / cr) : '—') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+}
+
+/* usHourLabel 时段列的完整标签：小时桶「MM-DD HH:00」（跨天窗口下只有 HH:00 分不清
+   是哪天），日桶「MM-DD」。t 的形态判别与 parsePointTime 同口径（长度 13 = 小时桶）。 */
+function usHourLabel(p) {
+  const s = p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00';
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return p.t;
+  const day = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
+  return p.scope === 'day' ? day : day + ' ' + String(d.getHours()).padStart(2, '0') + ':00';
+}
 
 /* parsePointTime 把后端的 t 解析成毫秒时间戳。 */
 function parsePointTime(p) {
@@ -3002,6 +3065,7 @@ async function loadUsage() {
     $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
     $('usDimBody').innerHTML = '<tr><td colspan="11" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
+    $('usHourBody').innerHTML = '<tr><td colspan="8" class="empty">读取用量失败</td></tr>';
   }
 }
 
@@ -3524,8 +3588,8 @@ function bindRestToggle(id) {
 bindRestToggle('expBody');
 bindRestToggle('compBody');
 
-/* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
-   规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
+/* ── 精简 QR 编码器（券码 + 登录授权链接用）────────────────────────────
+   规格子集：byte 模式、ECC L、版本 1-6（v6 两块相等，需交织）、固定掩码 0。
    完整性：规范允许任选掩码（解码器按格式信息位自行去掩码），固定掩码不影响
    可扫描性；已用 python qrcode 库对多输入多版本做逐像素交叉验证
    （强制 byte 模式 + mask 0，5/5 全部 diff=0）。面板 CSP 只允许 self，外链 QR 服务不可用。 */
@@ -3538,10 +3602,12 @@ const QR_EXP = new Array(512), QR_LOG = new Array(256);
 })();
 const gmul = (a, b) => (a && b) ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0;
 
-// 各版本参数（下标 = 版本-1）：[数据码字数, 纠错码字数]，ECC L 单块
-const QR_V = [[19, 7], [34, 10], [55, 15], [80, 20], [108, 26]];
+// 各版本参数（下标 = 版本-1）：[数据码字总数, 每块纠错码字数, 块数]，ECC L。
+// v1-5 单块（免交织）；v6 两块相等各 68 数据字。授权链接约 108 字节，v5 上限 106
+// 差两个字节，正好卡在版本边界上，所以必须补 v6。
+const QR_V = [[19, 7, 1], [34, 10, 1], [55, 15, 1], [80, 20, 1], [108, 26, 1], [136, 18, 2]];
 // 对齐图案中心坐标（v2+；与定位图案重叠的位置在放置时跳过）
-const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30]];
+const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34]];
 const QR_MASK = (r, c) => (r + c) % 2 === 0; // 掩码模式 0
 
 // 生成多项式（最高次系数在前，g[0] 恒为 1）
@@ -3594,8 +3660,8 @@ function qrMatrix(text) {
   // 版本选择：需求 ≈ 2 码字头 + 文本长度，取首个放得下的版本
   let ver = 0;
   for (let v = 0; v < QR_V.length; v++) { if (bytes.length + 2 <= QR_V[v][0]) { ver = v + 1; break; } }
-  if (!ver) throw new Error('QR: text too long (>' + QR_V[4][0] + ' bytes)');
-  const [dataCap, ecCap] = QR_V[ver - 1];
+  if (!ver) throw new Error('QR: text too long (>' + (QR_V[QR_V.length - 1][0] - 2) + ' bytes)');
+  const [dataCap, ecCap, nblk] = QR_V[ver - 1];
   const n = 17 + 4 * ver;
 
   const M = Array.from({ length: n }, () => new Array(n).fill(false));
@@ -3643,7 +3709,13 @@ function qrMatrix(text) {
 
   // 数据码字 + 纠错码字 → 位流
   const dcw = qrDataCodewords(text, dataCap);
-  const cw = dcw.concat(rsRem(dcw, ecCap));
+  // 分块独立算纠错，再按规范交织：先逐列取数据字，再逐列取纠错字（单块时即原顺序）
+  const per = dataCap / nblk;
+  const blk = Array.from({ length: nblk }, (_, i) => dcw.slice(i * per, (i + 1) * per));
+  const ecs = blk.map(b => rsRem(b, ecCap));
+  const cw = [];
+  for (let i = 0; i < per; i++) for (const b of blk) cw.push(b[i]);
+  for (let i = 0; i < ecCap; i++) for (const e of ecs) cw.push(e[i]);
   const bits = [];
   for (const b of cw) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
 
