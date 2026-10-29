@@ -457,6 +457,15 @@ func TestChatSyncEmptyUpstreamBodyIs502(t *testing.T) {
 
 func TestChatStreamPassthrough(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 首帧必须落在**首 token 计时开始之后**：tokensPerSecond 用
+		// (端到端 - TTFB) 作分母，而 TTFB<=0 被定义为「没有观测」→ 不报速率
+		// （handler.go tokensPerSecond 的 ttfb<=0 分支）。
+		//
+		// fake 的 body 是内存 strings.Reader，读首帧几乎零耗时；Windows 的
+		// time.Now() 粒度约 0.5~1ms，两次调用落进同一 tick 时 TTFB 恰好为 0，
+		// 于是 -count=N 或 CI 上偶发 LastTokensPerSecond=nil（本机 30 次复现 11 次、
+		// 与本次改动无关的既有 flake）。显式睡过时钟粒度，让 TTFB 恒 >0。
+		time.Sleep(2 * time.Millisecond)
 		return 200, sseOK, true
 	})
 	h := NewHandler(Config{
@@ -632,13 +641,9 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
 		t.Errorf("calls=%v want bad/good 各 1 次", calls)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
-	}
-	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
-		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
+	assertModelCooling(t, p, "bad", "glm-5.2", soft)
+	if p.PickByUIDForModel("bad", "deepseek-v4.1-flash") == nil {
+		t.Fatal("模型侧限流不得阻断同账号的其他模型")
 	}
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
@@ -772,13 +777,7 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
-	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
-		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
-	}
+	assertModelCooling(t, p, "bad", "glm-5.2", 600*time.Second)
 }
 
 // TestChatStickyFollowsFinalSuccess 端到端验证 D4：粘性号失败换号成功后，会话绑定收敛到成功号。
